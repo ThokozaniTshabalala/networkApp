@@ -1,0 +1,1 @@
+socket.gethostbyname(socket.gethostname())  # Gets local IP address
