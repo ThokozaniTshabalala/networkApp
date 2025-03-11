@@ -8,7 +8,7 @@ import traceback
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
                     format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[
+                    handlers=[ 
                         logging.FileHandler("seeder_debug.log"),
                         logging.StreamHandler()
                     ])
@@ -19,7 +19,10 @@ TRACKER_IP = LOCAL_IP
 TRACKER_ADDR = (TRACKER_IP, 6020)
 SEEDER_PORT = 7000
 FORMAT = 'utf-8'
-CHUNK_SIZE = 512  # bytes
+CHUNK_SIZE = 512 * 1024  # 512 KB in bytes
+
+# Constant for number of chunks to send to leechers
+CHUNKS_TO_BE_SENT = 2  # Change this value to control how many chunks to send
 
 class SeederServer:
     def __init__(self, filename):
@@ -43,6 +46,12 @@ class SeederServer:
         try:
             self.seeder_udp.sendto(f"REGISTER_SEEDER {self.filename} {SEEDER_PORT}".encode(FORMAT), TRACKER_ADDR)
             logging.info(f"Registered with tracker for file: {self.filename}")
+            
+            # Send the total number of chunks to the tracker
+            total_chunks = max(1, os.path.getsize(self.filename) // CHUNK_SIZE + 1)
+            self.seeder_udp.sendto(f"CHUNK_COUNT {total_chunks}".encode(FORMAT), TRACKER_ADDR)
+            logging.info(f"Sent chunk count to tracker: {total_chunks}")
+            
         except Exception as e:
             logging.error(f"Failed to register with tracker: {e}")
             logging.error(traceback.format_exc())
@@ -54,31 +63,57 @@ class SeederServer:
             # Set per-connection timeout
             conn.settimeout(30)
             
-            # Receive request
-            request = conn.recv(1024).decode(FORMAT).split()
-            logging.debug(f"Received request: {request}")
-            
-            if len(request) < 2:
-                logging.warning(f"Invalid request from {addr}")
-                conn.close()
-                return
+            while True:  # Keep accepting commands until client disconnects or error
+                # Receive request
+                request_data = conn.recv(1024)
+                if not request_data:  # Client closed connection
+                    logging.debug(f"Client {addr} closed connection")
+                    break
+                    
+                request = request_data.decode(FORMAT).split()
+                logging.debug(f"Received request: {request}")
+                
+                if len(request) < 2:
+                    logging.warning(f"Invalid request from {addr}")
+                    continue  # Wait for next request instead of closing
 
-            cmd, fname = request[0], request[1]
-            logging.info(f"Processing request from {addr}: {cmd} {fname}")
+                cmd, fname = request[0], request[1]
+                logging.info(f"Processing request from {addr}: {cmd} {fname}")
 
-            if cmd == "GET_CHUNK_COUNT" and fname == self.filename:
-                total_chunks = max(1, os.path.getsize(self.filename) // CHUNK_SIZE + 1)
-                conn.sendall(str(total_chunks).encode(FORMAT))
-                logging.info(f"Sent total chunks: {total_chunks}")
+                if cmd == "GET_CHUNK_COUNT" and fname == self.filename:
+                    total_chunks = max(1, os.path.getsize(self.filename) // CHUNK_SIZE + 1)
+                    conn.sendall(str(total_chunks).encode(FORMAT))
+                    logging.info(f"Sent total chunks: {total_chunks}")
 
-            elif cmd == "GET_CHUNK" and len(request) == 3:
-                chunk_id = int(request[2])
-                with open(self.filename, "rb") as f:
-                    f.seek(chunk_id * CHUNK_SIZE)
-                    chunk = f.read(CHUNK_SIZE)
-                    conn.sendall(chunk)
-                logging.info(f"Sent chunk {chunk_id}")
+                elif cmd == "GET_CHUNK" and len(request) == 3:
+                    chunk_id = int(request[2])
+                    
+                    if chunk_id >= CHUNKS_TO_BE_SENT:  # Only send chunks up to CHUNKS_TO_BE_SENT
+                        logging.info(f"Reached chunk limit of {CHUNKS_TO_BE_SENT}. Not sending more chunks.")
+                        break
+                    
+                    with open(self.filename, "rb") as f:
+                        f.seek(chunk_id * CHUNK_SIZE)
+                        chunk = f.read(CHUNK_SIZE)
+                        
+                        # Send in smaller portions to avoid blocking for too long
+                        bytes_sent = 0
+                        while bytes_sent < len(chunk):
+                            sent = conn.send(chunk[bytes_sent:bytes_sent + 8192])
+                            if sent == 0:
+                                raise RuntimeError("Socket connection broken")
+                            bytes_sent += sent
+                            
+                    logging.info(f"Sent chunk {chunk_id} ({bytes_sent} bytes)")
+                
+                elif cmd == "DONE":
+                    logging.info(f"Client {addr} indicated completion")
+                    break
 
+        except socket.timeout:
+            logging.info(f"Connection to {addr} timed out")
+        except ConnectionResetError:
+            logging.info(f"Connection to {addr} was reset")
         except Exception as e:
             logging.error(f"Error handling client {addr}: {e}")
             logging.error(traceback.format_exc())
@@ -121,7 +156,7 @@ class SeederServer:
         listening_thread.start()
 
 def main():
-    filename = "sample.txt"
+    filename = "large_text_file.txt"
     seeder = SeederServer(filename)
     seeder.start()
 
